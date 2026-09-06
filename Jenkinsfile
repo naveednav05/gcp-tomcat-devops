@@ -11,8 +11,8 @@ pipeline {
 
         string(
             name: 'HANDOFF_NUMBER',
-            defaultValue: 'HF-0098',
-            description: 'Enter handoff number in format HF-0000'
+            defaultValue: 'hf-0098',
+            description: 'Enter handoff number in format hf-0000 - all lowercase'
         )
 
         booleanParam(
@@ -34,10 +34,10 @@ pipeline {
 
                     def handoff = params.HANDOFF_NUMBER.trim()
 
-                    if (!(handoff ==~ /^HF-[0-9]{4}$/)) {
+                    if (!(handoff ==~ /^hf-[0-9]{4}$/)) {
                         error(
                             "Invalid handoff number: '${handoff}'. " +
-                            "Expected format: HF-0000. Example: HF-0098"
+                            "Expected format: hf-0000. Example: hf-0098 - all lowercase"
                         )
                     }
 
