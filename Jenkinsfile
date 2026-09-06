@@ -18,26 +18,20 @@ pipeline {
         booleanParam(
             name: 'REPLACE_HANDOFF',
             defaultValue: false,
-            description: 'Delete and replace an existing handoff artifact'
+            description: 'Replace an existing handoff after the new WAR is successfully built'
         )
     }
 
     environment {
 
-        PROJECT_ID      = 'gcp-gke-12345'
-        REGION          = 'asia-south1'
-        WAR_REPOSITORY  = 'war-files'
-        PACKAGE_NAME    = 'myapp'
-        WAR_NAME        = 'myapp.war'
+        PROJECT_ID     = 'gcp-gke-12345'
+        REGION         = 'asia-south1'
+        WAR_REPOSITORY = 'war-files'
+        PACKAGE_NAME   = 'myapp'
+        WAR_NAME       = 'myapp.war'
     }
 
     stages {
-
-        /*
-         * ==========================================================
-         * 1. VALIDATE HANDOFF NUMBER
-         * ==========================================================
-         */
 
         stage('Validate Handoff') {
 
@@ -51,16 +45,6 @@ pipeline {
 
                     echo "Handoff Number : ${params.HANDOFF_NUMBER}"
                     echo "Replace        : ${params.REPLACE_HANDOFF}"
-
-                    /*
-                     * Expected format:
-                     *
-                     * HF-0001
-                     * HF-0098
-                     * HF-1234
-                     *
-                     * Exactly HF- followed by 4 digits.
-                     */
 
                     if (!(params.HANDOFF_NUMBER ==~ /^HF-[0-9]{4}$/)) {
 
@@ -80,17 +64,11 @@ HF-1234
 """
                     }
 
-                    echo "Handoff format validated successfully."
+                    echo "Handoff format is valid."
                 }
             }
         }
 
-
-        /*
-         * ==========================================================
-         * 2. CHECK WHETHER HANDOFF ALREADY EXISTS
-         * ==========================================================
-         */
 
         stage('Check Existing Handoff') {
 
@@ -104,28 +82,23 @@ HF-1234
 
                     def handoff = params.HANDOFF_NUMBER
 
-                    /*
-                     * Get all versions for the myapp package
-                     * and check whether our handoff exists.
-                     */
-
-                    def existingVersion = sh(
+                    def versionsOutput = sh(
                         script: """
                             gcloud artifacts versions list \
                                 --project=${PROJECT_ID} \
                                 --location=${REGION} \
                                 --repository=${WAR_REPOSITORY} \
                                 --package=${PACKAGE_NAME} \
-                                --format="value(version)"
+                                --format="value(name.basename())"
                         """,
                         returnStdout: true
                     ).trim()
 
                     def handoffExists = false
 
-                    if (existingVersion) {
+                    if (versionsOutput) {
 
-                        def versions = existingVersion.split("\\\\n")
+                        def versions = versionsOutput.split("\\n")
 
                         for (def version : versions) {
 
@@ -135,12 +108,6 @@ HF-1234
                             }
                         }
                     }
-
-                    /*
-                     * --------------------------------------------------
-                     * HANDOFF ALREADY EXISTS
-                     * --------------------------------------------------
-                     */
 
                     if (handoffExists) {
 
@@ -158,68 +125,35 @@ HANDOFF ALREADY EXISTS
 Handoff:
 ${handoff}
 
-Artifact Registry:
+Artifact:
 ${WAR_REPOSITORY}/${PACKAGE_NAME}/${handoff}
 
 REPLACE_HANDOFF is FALSE.
 
-The build has been stopped to prevent
-accidental replacement.
+Build stopped to prevent accidental replacement.
 
-If you intentionally want to replace this
-handoff, run the job again with:
+If you intentionally want to replace this handoff,
+run the job again with:
 
 REPLACE_HANDOFF = TRUE
 """
                         }
 
-                        /*
-                         * ------------------------------------------------
-                         * REPLACE ENABLED
-                         * ------------------------------------------------
-                         */
+                        echo "Existing handoff found."
+                        echo "Replacement has been requested."
+                        echo "The existing artifact will NOT be deleted yet."
+                        echo "It will only be deleted after the new WAR builds successfully."
 
-                        echo "⚠️ REPLACE_HANDOFF = TRUE"
-                        echo ""
-                        echo "Existing handoff will be deleted."
-                        echo "A new WAR will then be uploaded."
-                        echo ""
-
-                        sh """
-                            gcloud artifacts versions delete ${handoff} \
-                                --project=${PROJECT_ID} \
-                                --location=${REGION} \
-                                --repository=${WAR_REPOSITORY} \
-                                --package=${PACKAGE_NAME} \
-                                --quiet
-                        """
-
-                        echo ""
-                        echo "Existing handoff deleted successfully."
-                    }
-
-                    /*
-                     * --------------------------------------------------
-                     * HANDOFF DOES NOT EXIST
-                     * --------------------------------------------------
-                     */
-
-                    else {
+                    } else {
 
                         echo ""
                         echo "Handoff ${handoff} does not exist."
-                        echo "Proceeding with new handoff build."
+                        echo "Proceeding as a new handoff."
                     }
                 }
             }
         }
 
-
-        /*
-         * ==========================================================
-         * 3. CHECKOUT SOURCE CODE
-         * ==========================================================
-         */
 
         stage('Checkout Application') {
 
@@ -241,26 +175,16 @@ REPLACE_HANDOFF = TRUE
                     git rev-parse --short HEAD
 
                     echo ""
-                    echo "Git repository:"
-                    git remote -v
-
-                    echo ""
                     echo "Workspace:"
                     pwd
 
                     echo ""
-                    echo "Files:"
+                    echo "Application files:"
                     ls -la
                 '''
             }
         }
 
-
-        /*
-         * ==========================================================
-         * 4. BUILD WAR
-         * ==========================================================
-         */
 
         stage('Build WAR') {
 
@@ -276,12 +200,6 @@ REPLACE_HANDOFF = TRUE
             }
         }
 
-
-        /*
-         * ==========================================================
-         * 5. VERIFY WAR
-         * ==========================================================
-         */
 
         stage('Verify WAR') {
 
@@ -309,11 +227,54 @@ REPLACE_HANDOFF = TRUE
         }
 
 
-        /*
-         * ==========================================================
-         * 6. UPLOAD WAR TO ARTIFACT REGISTRY
-         * ==========================================================
-         */
+        stage('Delete Existing Handoff') {
+
+            when {
+
+                expression {
+                    return params.REPLACE_HANDOFF
+                }
+            }
+
+            steps {
+
+                script {
+
+                    def handoff = params.HANDOFF_NUMBER
+
+                    /*
+                     * We only reach this stage if:
+                     *
+                     * 1. REPLACE_HANDOFF = true
+                     * 2. The new WAR was successfully built
+                     * 3. WAR verification succeeded
+                     */
+
+                    echo '=========================================='
+                    echo '       REPLACING EXISTING HANDOFF'
+                    echo '=========================================='
+
+                    echo ""
+                    echo "⚠️ Existing handoff will now be deleted."
+                    echo ""
+                    echo "Handoff : ${handoff}"
+                    echo ""
+
+                    sh """
+                        gcloud artifacts versions delete ${handoff} \
+                            --project=${PROJECT_ID} \
+                            --location=${REGION} \
+                            --repository=${WAR_REPOSITORY} \
+                            --package=${PACKAGE_NAME} \
+                            --quiet
+                    """
+
+                    echo ""
+                    echo "Existing ${handoff} artifact deleted."
+                }
+            }
+        }
+
 
         stage('Upload WAR') {
 
@@ -324,13 +285,14 @@ REPLACE_HANDOFF = TRUE
                     def handoff = params.HANDOFF_NUMBER
 
                     echo '=========================================='
-                    echo '         UPLOADING WAR'
+                    echo '            UPLOADING WAR'
                     echo '=========================================='
 
                     echo ""
-                    echo "Handoff : ${handoff}"
-                    echo "Package : ${PACKAGE_NAME}"
-                    echo "WAR     : ${WAR_NAME}"
+                    echo "Repository : ${WAR_REPOSITORY}"
+                    echo "Package    : ${PACKAGE_NAME}"
+                    echo "Version    : ${handoff}"
+                    echo "WAR        : ${WAR_NAME}"
                     echo ""
 
                     sh """
@@ -350,12 +312,6 @@ REPLACE_HANDOFF = TRUE
         }
 
 
-        /*
-         * ==========================================================
-         * 7. VERIFY ARTIFACT
-         * ==========================================================
-         */
-
         stage('Verify Artifact') {
 
             steps {
@@ -365,28 +321,32 @@ REPLACE_HANDOFF = TRUE
                     def handoff = params.HANDOFF_NUMBER
 
                     echo '=========================================='
-                    echo '        VERIFYING ARTIFACT'
+                    echo '           VERIFYING ARTIFACT'
                     echo '=========================================='
 
-                    def result = sh(
+                    def versionsOutput = sh(
                         script: """
                             gcloud artifacts versions list \
                                 --project=${PROJECT_ID} \
                                 --location=${REGION} \
                                 --repository=${WAR_REPOSITORY} \
                                 --package=${PACKAGE_NAME} \
-                                --format="value(version)"
+                                --format="value(name.basename())"
                         """,
                         returnStdout: true
                     ).trim()
 
-                    if (!result.split("\\\\n").collect { it.trim() }.contains(handoff)) {
+                    def versions = versionsOutput ?
+                        versionsOutput.split("\\n").collect { it.trim() } :
+                        []
+
+                    if (!versions.contains(handoff)) {
 
                         error """
 ARTIFACT VERIFICATION FAILED
 
-Handoff ${handoff} was uploaded but could
-not be found during verification.
+Handoff ${handoff} was uploaded but could not
+be found during verification.
 """
                     }
 
@@ -396,18 +356,12 @@ not be found during verification.
                     echo "Repository : ${WAR_REPOSITORY}"
                     echo "Package    : ${PACKAGE_NAME}"
                     echo "Version    : ${handoff}"
-                    echo "File       : ${WAR_NAME}"
+                    echo "WAR        : ${WAR_NAME}"
                 }
             }
         }
     }
 
-
-    /*
-     * ==============================================================
-     * POST BUILD
-     * ==============================================================
-     */
 
     post {
 
@@ -444,6 +398,8 @@ not be found during verification.
             echo "=========================================="
             echo ""
             echo "Handoff Number : ${params.HANDOFF_NUMBER}"
+            echo ""
+            echo "No successful handoff was reported."
             echo ""
             echo "Check the Jenkins console output."
             echo ""
