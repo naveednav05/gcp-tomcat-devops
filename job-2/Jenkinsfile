@@ -78,10 +78,13 @@ pipeline {
                     echo "----------------------------------------------"
 
                     if (availableVersions) {
+
                         availableVersions.each {
                             echo "  ${it}"
                         }
+
                     } else {
+
                         echo "  No versions found."
                     }
 
@@ -103,7 +106,58 @@ pipeline {
 
         /*
          * ============================================================
-         * 3. CHECKOUT ONLY JOB-2
+         * 3. CHECK IF DOCKER IMAGE ALREADY EXISTS
+         *
+         * Prevents the same handoff from being reused.
+         * ============================================================
+         */
+        stage('Check Existing Docker Image') {
+            steps {
+                script {
+
+                    def handoff = params.HANDOFF_NUMBER.trim()
+
+                    def imageName =
+                        "asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp:${handoff}"
+
+                    echo "=============================================="
+                    echo "Checking Existing Docker Image"
+                    echo "=============================================="
+                    echo "Image: ${imageName}"
+
+                    def imageExists = sh(
+                        script: """
+                            if gcloud artifacts docker images describe \
+                              '${imageName}' \
+                              --project=gcp-gke-12345 \
+                              >/dev/null 2>&1
+                            then
+                                echo "true"
+                            else
+                                echo "false"
+                            fi
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    if (imageExists == "true") {
+
+                        error(
+                            "Docker image '${imageName}' already exists. " +
+                            "The handoff '${handoff}' cannot be reused."
+                        )
+                    }
+
+                    echo "✅ Docker image does not exist."
+                    echo "Safe to continue."
+                }
+            }
+        }
+
+
+        /*
+         * ============================================================
+         * 4. CHECKOUT ONLY JOB-2
          * ============================================================
          */
         stage('Checkout Dockerfile') {
@@ -159,7 +213,7 @@ pipeline {
 
         /*
          * ============================================================
-         * 4. DOWNLOAD WAR
+         * 5. DOWNLOAD WAR
          * ============================================================
          */
         stage('Download WAR') {
@@ -209,7 +263,7 @@ pipeline {
 
         /*
          * ============================================================
-         * 5. PREPARE DOCKER BUILD CONTEXT
+         * 6. PREPARE DOCKER BUILD CONTEXT
          * ============================================================
          */
         stage('Prepare Docker Build Context') {
@@ -236,7 +290,7 @@ pipeline {
 
         /*
          * ============================================================
-         * 6. VALIDATE DOCKER BUILD CONTEXT
+         * 7. VALIDATE DOCKER BUILD CONTEXT
          * ============================================================
          */
         stage('Validate Docker Build Context') {
@@ -263,7 +317,7 @@ pipeline {
 
         /*
          * ============================================================
-         * 7. AUTHENTICATE DOCKER WITH ARTIFACT REGISTRY
+         * 8. AUTHENTICATE DOCKER WITH ARTIFACT REGISTRY
          * ============================================================
          */
         stage('Authenticate Docker') {
@@ -284,7 +338,7 @@ pipeline {
 
         /*
          * ============================================================
-         * 8. PULL PRIVATE TOMCAT BASE IMAGE
+         * 9. PULL PRIVATE TOMCAT BASE IMAGE
          * ============================================================
          */
         stage('Pull Tomcat Base Image') {
@@ -304,7 +358,7 @@ pipeline {
 
         /*
          * ============================================================
-         * 9. BUILD FINAL APPLICATION IMAGE
+         * 10. BUILD FINAL APPLICATION IMAGE
          * ============================================================
          */
         stage('Build Docker Image') {
@@ -333,7 +387,7 @@ pipeline {
 
         /*
          * ============================================================
-         * 10. INSPECT IMAGE
+         * 11. INSPECT IMAGE
          * ============================================================
          */
         stage('Inspect Docker Image') {
@@ -370,7 +424,7 @@ pipeline {
 
         /*
          * ============================================================
-         * 11. PUSH IMAGE
+         * 12. PUSH IMAGE
          * ============================================================
          */
         stage('Push Docker Image') {
@@ -397,41 +451,45 @@ pipeline {
 
         /*
          * ============================================================
-         * 12. VERIFY IMAGE IN ARTIFACT REGISTRY
+         * 13. VERIFY IMAGE IN ARTIFACT REGISTRY
          * ============================================================
          */
-      stage('Verify Docker Image') {
-    steps {
-        script {
+        stage('Verify Docker Image') {
+            steps {
+                script {
 
-            def handoff = params.HANDOFF_NUMBER.trim()
+                    def handoff = params.HANDOFF_NUMBER.trim()
 
-            def image = sh(
-                script: """
-                    gcloud artifacts docker images describe \
-                      asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp:${handoff} \
-                      --format="value(image_summary.digest)"
-                """,
-                returnStdout: true
-            ).trim()
+                    def image = sh(
+                        script: """
+                            gcloud artifacts docker images describe \
+                              asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp:${handoff} \
+                              --project=gcp-gke-12345 \
+                              --format="value(image_summary.digest)"
+                        """,
+                        returnStdout: true
+                    ).trim()
 
-            if (!image) {
-                error(
-                    "Docker image verification failed. " +
-                    "Image '${handoff}' was not found in Artifact Registry."
-                )
+                    if (!image) {
+
+                        error(
+                            "Docker image verification failed. " +
+                            "Image '${handoff}' was not found in Artifact Registry."
+                        )
+                    }
+
+                    echo ""
+                    echo "=============================================="
+                    echo "DOCKER IMAGE VERIFIED"
+                    echo "=============================================="
+                    echo "Tag    : ${handoff}"
+                    echo "Digest : ${image}"
+                    echo "=============================================="
+                }
             }
-
-            echo ""
-            echo "=============================================="
-            echo "DOCKER IMAGE VERIFIED"
-            echo "=============================================="
-            echo "Tag    : ${handoff}"
-            echo "Digest : ${image}"
-            echo "=============================================="
         }
     }
-}
+
 
     /*
      * ================================================================
@@ -461,6 +519,7 @@ pipeline {
             }
         }
 
+
         failure {
 
             echo ""
@@ -470,6 +529,7 @@ pipeline {
             echo "Check the failed stage above."
             echo "=============================================="
         }
+
 
         always {
 
@@ -484,5 +544,4 @@ pipeline {
             '''
         }
     }
-}
 }
