@@ -10,13 +10,18 @@ pipeline {
 
     stages {
 
+        /*
+         * ============================================================
+         * 1. VALIDATE HANDOFF NUMBER
+         * ============================================================
+         */
         stage('Validate Handoff') {
             steps {
                 script {
 
                     if (!params.HANDOFF_NUMBER) {
                         error(
-                            "HANDOFF_NUMBER parameter was not provided."
+                            "HANDOFF_NUMBER was not provided."
                         )
                     }
 
@@ -24,7 +29,7 @@ pipeline {
 
                     if (!(handoff ==~ /^hf-[0-9]{4}$/)) {
                         error(
-                            "Invalid HANDOFF_NUMBER '${handoff}'. " +
+                            "Invalid handoff number: '${handoff}'. " +
                             "Expected format: hf-0000. Example: hf-0098"
                         )
                     }
@@ -39,6 +44,11 @@ pipeline {
         }
 
 
+        /*
+         * ============================================================
+         * 2. CHECK WAR ARTIFACT
+         * ============================================================
+         */
         stage('Check WAR Artifact') {
             steps {
                 script {
@@ -48,7 +58,7 @@ pipeline {
                     echo "Checking Artifact Registry..."
                     echo "Requested handoff: ${handoff}"
 
-                    def versions = sh(
+                    def output = sh(
                         script: '''
                             gcloud artifacts versions list \
                               --project=gcp-gke-12345 \
@@ -61,38 +71,97 @@ pipeline {
                     ).trim()
 
                     def availableVersions =
-                        versions ? versions.readLines() : []
+                        output ? output.readLines() : []
+
+                    echo ""
+                    echo "Available handoff versions:"
+                    echo "----------------------------------------------"
+
+                    if (availableVersions) {
+                        availableVersions.each {
+                            echo "  ${it}"
+                        }
+                    } else {
+                        echo "  No versions found."
+                    }
+
+                    echo "----------------------------------------------"
 
                     if (!availableVersions.contains(handoff)) {
 
-                        echo ""
-                        echo "❌ Handoff ${handoff} was NOT found."
-                        echo ""
-                        echo "Available handoff versions:"
-                        echo "----------------------------------------------"
-
-                        if (availableVersions) {
-                            availableVersions.each {
-                                echo "  ${it}"
-                            }
-                        } else {
-                            echo "  No handoff versions found."
-                        }
-
-                        echo "----------------------------------------------"
-
                         error(
-                            "WAR artifact for handoff ${handoff} does not exist."
+                            "WAR artifact for handoff '${handoff}' " +
+                            "was not found in Artifact Registry."
                         )
                     }
 
-                    echo ""
-                    echo "✅ Handoff ${handoff} exists."
+                    echo "✅ Handoff '${handoff}' exists."
                 }
             }
         }
 
 
+        /*
+         * ============================================================
+         * 3. CHECKOUT ONLY JOB-2
+         * ============================================================
+         */
+        stage('Checkout Dockerfile') {
+            steps {
+
+                checkout([
+                    $class: 'GitSCM',
+
+                    branches: [[
+                        name: '*/PROD'
+                    ]],
+
+                    userRemoteConfigs: [[
+                        url: 'https://github.com/naveednav05/gcp-tomcat-devops.git',
+                        credentialsId: 'github-gcp-tomcat'
+                    ]],
+
+                    extensions: [
+
+                        [
+                            $class: 'SparseCheckoutPaths',
+
+                            sparseCheckoutPaths: [[
+                                path: 'job-2/'
+                            ]]
+                        ],
+
+                        [
+                            $class: 'CleanBeforeCheckout'
+                        ]
+                    ]
+                ])
+
+                sh '''
+                    echo "=============================================="
+                    echo "Validating Git Checkout"
+                    echo "=============================================="
+
+                    if [ ! -f job-2/Dockerfile ]; then
+                        echo "ERROR: job-2/Dockerfile not found."
+                        exit 1
+                    fi
+
+                    echo "✅ Dockerfile found."
+
+                    echo ""
+                    echo "Checked out files:"
+                    find job-2 -maxdepth 2 -type f -print
+                '''
+            }
+        }
+
+
+        /*
+         * ============================================================
+         * 4. DOWNLOAD WAR
+         * ============================================================
+         */
         stage('Download WAR') {
             steps {
                 script {
@@ -117,64 +186,44 @@ pipeline {
                           --version='${handoff}' \
                           --name=myapp.war \
                           --destination="\$PWD/build-context"
-
-                        echo ""
-                        echo "Downloaded artifact:"
-                        ls -lh build-context/myapp.war
                     """
 
                     sh '''
                         if [ ! -f build-context/myapp.war ]; then
-                            echo "ERROR: WAR file was not downloaded."
+                            echo "ERROR: myapp.war was not downloaded."
                             exit 1
                         fi
+
+                        echo ""
+                        echo "Downloaded WAR:"
+                        ls -lh build-context/myapp.war
+
+                        echo ""
+                        echo "WAR SHA256:"
+                        sha256sum build-context/myapp.war
                     '''
                 }
             }
         }
 
 
-        stage('Checkout Dockerfile') {
+        /*
+         * ============================================================
+         * 5. PREPARE DOCKER BUILD CONTEXT
+         * ============================================================
+         */
+        stage('Prepare Docker Build Context') {
             steps {
-
-                checkout([
-                    $class: 'GitSCM',
-
-                    branches: [[
-                        name: '*/PROD'
-                    ]],
-
-                    userRemoteConfigs: [[
-                        url: 'https://github.com/naveednav05/gcp-tomcat-devops.git',
-                        credentialsId: 'github-gcp-tomcat'
-                    ]],
-
-                    extensions: [
-
-                        [
-                            $class: 'SparseCheckoutPaths',
-
-                            sparseCheckoutPaths: [[
-                                path: 'job-2/'
-                            ]]
-                        ]
-                    ]
-                ])
 
                 sh '''
                     echo "=============================================="
-                    echo "Checking Dockerfile"
+                    echo "Preparing Docker Build Context"
                     echo "=============================================="
-
-                    if [ ! -f job-2/Dockerfile ]; then
-                        echo "ERROR: job-2/Dockerfile not found."
-                        exit 1
-                    fi
 
                     cp job-2/Dockerfile build-context/Dockerfile
 
                     echo ""
-                    echo "Docker build context:"
+                    echo "Build context:"
                     ls -lh build-context/
 
                     echo ""
@@ -185,6 +234,11 @@ pipeline {
         }
 
 
+        /*
+         * ============================================================
+         * 6. VALIDATE DOCKER BUILD CONTEXT
+         * ============================================================
+         */
         stage('Validate Docker Build Context') {
             steps {
 
@@ -196,23 +250,28 @@ pipeline {
                     test -f build-context/Dockerfile
                     test -f build-context/myapp.war
 
-                    echo "Dockerfile : OK"
-                    echo "WAR file   : OK"
+                    echo "✅ Dockerfile exists."
+                    echo "✅ WAR file exists."
 
                     echo ""
-                    echo "WAR checksum:"
-                    sha256sum build-context/myapp.war
+                    echo "Files to be used for Docker build:"
+                    ls -lh build-context/
                 '''
             }
         }
 
 
+        /*
+         * ============================================================
+         * 7. AUTHENTICATE DOCKER WITH ARTIFACT REGISTRY
+         * ============================================================
+         */
         stage('Authenticate Docker') {
             steps {
 
                 sh '''
                     echo "=============================================="
-                    echo "Configuring Artifact Registry Authentication"
+                    echo "Configuring Docker Authentication"
                     echo "=============================================="
 
                     gcloud auth configure-docker \
@@ -223,6 +282,11 @@ pipeline {
         }
 
 
+        /*
+         * ============================================================
+         * 8. PULL PRIVATE TOMCAT BASE IMAGE
+         * ============================================================
+         */
         stage('Pull Tomcat Base Image') {
             steps {
 
@@ -238,6 +302,11 @@ pipeline {
         }
 
 
+        /*
+         * ============================================================
+         * 9. BUILD FINAL APPLICATION IMAGE
+         * ============================================================
+         */
         stage('Build Docker Image') {
             steps {
                 script {
@@ -246,7 +315,7 @@ pipeline {
 
                     sh """
                         echo "=============================================="
-                        echo "Building Application Docker Image"
+                        echo "Building Docker Image"
                         echo "=============================================="
 
                         docker build \
@@ -255,13 +324,18 @@ pipeline {
                           build-context
 
                         echo ""
-                        echo "Docker image created successfully."
+                        echo "✅ Docker image built successfully."
                     """
                 }
             }
         }
 
 
+        /*
+         * ============================================================
+         * 10. INSPECT IMAGE
+         * ============================================================
+         */
         stage('Inspect Docker Image') {
             steps {
                 script {
@@ -270,24 +344,21 @@ pipeline {
 
                     sh """
                         echo "=============================================="
-                        echo "Inspecting Docker Image"
+                        echo "Docker Image Details"
                         echo "=============================================="
 
                         docker image inspect \
                           asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp:${handoff} \
                           --format='Image ID: {{.Id}}'
 
-                        echo ""
                         docker image inspect \
                           asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp:${handoff} \
                           --format='Created: {{.Created}}'
 
-                        echo ""
                         docker image inspect \
                           asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp:${handoff} \
                           --format='Entrypoint: {{json .Config.Entrypoint}}'
 
-                        echo ""
                         docker image inspect \
                           asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp:${handoff} \
                           --format='Cmd: {{json .Config.Cmd}}'
@@ -297,6 +368,11 @@ pipeline {
         }
 
 
+        /*
+         * ============================================================
+         * 11. PUSH IMAGE
+         * ============================================================
+         */
         stage('Push Docker Image') {
             steps {
                 script {
@@ -310,41 +386,52 @@ pipeline {
 
                         docker push \
                           asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp:${handoff}
+
+                        echo ""
+                        echo "✅ Docker push completed."
                     """
                 }
             }
         }
 
 
+        /*
+         * ============================================================
+         * 12. VERIFY IMAGE IN ARTIFACT REGISTRY
+         * ============================================================
+         */
         stage('Verify Docker Image') {
             steps {
                 script {
 
                     def handoff = params.HANDOFF_NUMBER.trim()
 
-                    def imageExists = sh(
+                    def imageTags = sh(
                         script: """
                             gcloud artifacts docker images list \
                               asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp \
                               --include-tags \
-                              --format="value(tags)" \
-                              | tr ',' '\\n' \
-                              | grep -Fx '${handoff}' || true
+                              --format="value(tags)"
                         """,
                         returnStdout: true
                     ).trim()
 
-                    if (imageExists != handoff) {
+                    def tagFound = imageTags
+                        .split(',')
+                        .collect { it.trim() }
+                        .contains(handoff)
+
+                    if (!tagFound) {
 
                         error(
                             "Docker image verification failed. " +
-                            "Image tag '${handoff}' was not found."
+                            "Tag '${handoff}' was not found in Artifact Registry."
                         )
                     }
 
                     echo ""
                     echo "=============================================="
-                    echo "DOCKER IMAGE VERIFIED"
+                    echo "✅ DOCKER IMAGE VERIFIED"
                     echo "=============================================="
                     echo "Image:"
                     echo "asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp:${handoff}"
@@ -355,6 +442,11 @@ pipeline {
     }
 
 
+    /*
+     * ================================================================
+     * POST ACTIONS
+     * ================================================================
+     */
     post {
 
         success {
@@ -366,10 +458,14 @@ pipeline {
                 echo "=============================================="
                 echo "🎉 JOB 2 SUCCESS"
                 echo "=============================================="
-                echo "Handoff Number : ${handoff}"
+                echo ""
+                echo "Handoff Number:"
+                echo "${handoff}"
                 echo ""
                 echo "Docker Image:"
                 echo "asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp:${handoff}"
+                echo ""
+                echo "Status: SUCCESS"
                 echo "=============================================="
             }
         }
@@ -380,7 +476,7 @@ pipeline {
             echo "=============================================="
             echo "❌ JOB 2 FAILED"
             echo "=============================================="
-            echo "Review the failed stage above."
+            echo "Check the failed stage above."
             echo "=============================================="
         }
 
@@ -388,12 +484,12 @@ pipeline {
 
             sh '''
                 echo "=============================================="
-                echo "Cleaning Jenkins Docker Workspace"
+                echo "Jenkins Workspace Cleanup"
                 echo "=============================================="
 
                 rm -rf build-context || true
 
-                docker image prune -f || true
+                echo "Temporary Docker build context removed."
             '''
         }
     }
