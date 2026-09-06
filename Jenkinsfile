@@ -12,7 +12,7 @@ pipeline {
         string(
             name: 'HANDOFF_NUMBER',
             defaultValue: 'HF-0098',
-            description: 'Enter handoff number in format HF-0000'
+            description: 'Enter handoff number. Format: HF-0000'
         )
 
         booleanParam(
@@ -22,38 +22,21 @@ pipeline {
         )
     }
 
-    environment {
-
-        PROJECT_ID      = 'gcp-gke-12345'
-        REGION          = 'asia-south1'
-        WAR_REPOSITORY  = 'war-files'
-        PACKAGE_NAME    = 'myapp'
-        WAR_FILE        = 'myapp.war'
-
-        HANDOFF         = ''
-        HANDOFF_EXISTS  = 'false'
-    }
-
     stages {
 
-        /*
-         * =========================================================
-         * 1. VALIDATE HANDOFF NUMBER
-         * =========================================================
-         */
         stage('Validate Handoff') {
 
             steps {
 
                 script {
 
-                    def handoff = params.HANDOFF_NUMBER?.trim()
+                    def handoff = params.HANDOFF_NUMBER.trim()
 
                     if (!(handoff ==~ /^HF-[0-9]{4}$/)) {
 
                         error(
-                            "Invalid HANDOFF_NUMBER '${handoff}'. " +
-                            "Expected format: HF-0000, example: HF-0098"
+                            "Invalid handoff '${handoff}'. " +
+                            "Expected format HF-0000, example HF-0098."
                         )
                     }
 
@@ -68,91 +51,78 @@ pipeline {
         }
 
 
-        /*
-         * =========================================================
-         * 2. CHECK WHETHER HANDOFF ALREADY EXISTS
-         * =========================================================
-         */
         stage('Check Existing Handoff') {
 
             steps {
 
                 script {
 
-                    echo "Checking Artifact Registry for ${env.HANDOFF}..."
+                    echo "Checking Artifact Registry..."
 
-                    def versionsOutput = sh(
-                        script: """
+                    def output = sh(
+                        script: '''
                             gcloud artifacts versions list \
-                              --project=${env.PROJECT_ID} \
-                              --location=${env.REGION} \
-                              --repository=${env.WAR_REPOSITORY} \
-                              --package=${env.PACKAGE_NAME} \
+                              --project=gcp-gke-12345 \
+                              --location=asia-south1 \
+                              --repository=war-files \
+                              --package=myapp \
                               --format="value(name.basename())" \
                               2>/dev/null
-                        """,
+                        ''',
                         returnStdout: true
                     ).trim()
 
-                    def existingVersions = versionsOutput
-                        ? versionsOutput.readLines()
-                        : []
+                    def versions = []
 
-                    def handoffExists =
-                        existingVersions
-                            .collect { it.trim() }
-                            .contains(env.HANDOFF)
+                    if (output) {
+                        versions = output.readLines()
+                    }
 
-                    env.HANDOFF_EXISTS = handoffExists.toString()
+                    def exists = versions.contains(env.HANDOFF)
 
-                    if (handoffExists) {
+                    env.HANDOFF_EXISTS = exists ? 'true' : 'false'
 
-                        echo "⚠️ Handoff ${env.HANDOFF} already exists."
+                    echo "Existing versions:"
+                    echo "${versions}"
 
-                        if (!params.REPLACE_HANDOFF) {
+                    echo "Handoff ${env.HANDOFF} exists: ${env.HANDOFF_EXISTS}"
 
-                            error(
-                                "Handoff ${env.HANDOFF} already exists. " +
-                                "Set REPLACE_HANDOFF=true if you want to replace it."
-                            )
-                        }
+                    if (exists && !params.REPLACE_HANDOFF) {
 
-                        echo "REPLACE_HANDOFF=true"
-                        echo "Existing handoff will be replaced after successful build."
+                        error(
+                            "Handoff ${env.HANDOFF} already exists. " +
+                            "Set REPLACE_HANDOFF=true to replace it."
+                        )
+                    }
 
-                    } else {
+                    if (exists && params.REPLACE_HANDOFF) {
 
-                        echo "✅ Handoff ${env.HANDOFF} does not exist."
+                        echo "⚠️ Existing handoff found."
+                        echo "Replacement requested."
+                        echo "Old artifact will be deleted AFTER successful WAR build."
+                    }
 
-                        echo "New handoff will be uploaded."
+                    if (!exists) {
 
+                        echo "✅ Handoff does not exist."
+                        echo "New artifact will be uploaded."
                     }
                 }
             }
         }
 
 
-        /*
-         * =========================================================
-         * 3. CHECKOUT SOURCE CODE
-         * =========================================================
-         */
         stage('Checkout') {
 
             steps {
 
                 checkout scm
 
-                echo "Source code checked out successfully."
+                echo "Git checkout completed."
             }
         }
 
 
-        /*
-         * =========================================================
-         * 4. BUILD WAR
-         * =========================================================
-         */
         stage('Build WAR') {
 
             steps {
@@ -165,188 +135,164 @@ pipeline {
                     mvn clean package
 
                     echo ""
-                    echo "Maven build completed."
+                    echo "Maven build completed successfully."
                 '''
             }
         }
 
 
-        /*
-         * =========================================================
-         * 5. VERIFY WAR
-         * =========================================================
-         */
         stage('Verify WAR') {
 
             steps {
 
-                sh """
-                    echo "Checking WAR file..."
+                sh '''
+                    echo "======================================"
+                    echo "Verifying WAR"
+                    echo "======================================"
 
-                    if [ ! -f "target/${WAR_FILE}" ]; then
-                        echo "ERROR: target/${WAR_FILE} not found."
+                    if [ ! -f target/myapp.war ]; then
+
+                        echo "ERROR: target/myapp.war does not exist."
+
                         exit 1
                     fi
 
                     echo ""
-                    echo "WAR file found:"
-                    ls -lh "target/${WAR_FILE}"
+                    echo "WAR file:"
+                    ls -lh target/myapp.war
 
                     echo ""
-                    echo "WAR checksum:"
-                    sha256sum "target/${WAR_FILE}"
-                """
+                    echo "SHA256:"
+                    sha256sum target/myapp.war
+                '''
             }
         }
 
 
-        /*
-         * =========================================================
-         * 6. DELETE OLD HANDOFF
-         *
-         * IMPORTANT:
-         * Delete ONLY when:
-         *
-         * REPLACE_HANDOFF = true
-         * AND
-         * HANDOFF_EXISTS  = true
-         *
-         * This fixes the previous failure.
-         * =========================================================
-         */
         stage('Delete Existing Handoff') {
 
             when {
 
-                allOf {
-
-                    expression {
-                        return params.REPLACE_HANDOFF
-                    }
-
-                    expression {
-                        return env.HANDOFF_EXISTS == 'true'
-                    }
+                expression {
+                    return params.REPLACE_HANDOFF &&
+                           env.HANDOFF_EXISTS == 'true'
                 }
             }
 
             steps {
 
-                sh """
+                script {
+
+                    def handoff = env.HANDOFF
+
                     echo "======================================"
-                    echo "Deleting existing handoff"
+                    echo "Deleting Existing Handoff"
                     echo "======================================"
 
-                    echo "Handoff: ${HANDOFF}"
+                    echo "Deleting: ${handoff}"
 
-                    gcloud artifacts versions delete "${HANDOFF}" \
-                      --project=${PROJECT_ID} \
-                      --location=${REGION} \
-                      --repository=${WAR_REPOSITORY} \
-                      --package=${PACKAGE_NAME} \
-                      --quiet
+                    sh """
+                        gcloud artifacts versions delete '${handoff}' \
+                          --project=gcp-gke-12345 \
+                          --location=asia-south1 \
+                          --repository=war-files \
+                          --package=myapp \
+                          --quiet
+                    """
 
-                    echo ""
                     echo "Existing handoff deleted successfully."
-                """
+                }
             }
         }
 
 
-        /*
-         * =========================================================
-         * 7. UPLOAD WAR
-         * =========================================================
-         */
         stage('Upload WAR') {
 
             steps {
 
-                sh """
+                script {
+
+                    def handoff = env.HANDOFF
+
                     echo "======================================"
-                    echo "Uploading WAR to Artifact Registry"
+                    echo "Uploading WAR"
                     echo "======================================"
 
-                    echo "Project      : ${PROJECT_ID}"
-                    echo "Repository   : ${WAR_REPOSITORY}"
-                    echo "Package      : ${PACKAGE_NAME}"
-                    echo "Version      : ${HANDOFF}"
-                    echo "File         : ${WAR_FILE}"
+                    echo "Project    : gcp-gke-12345"
+                    echo "Region     : asia-south1"
+                    echo "Repository : war-files"
+                    echo "Package    : myapp"
+                    echo "Version    : ${handoff}"
+                    echo "WAR        : target/myapp.war"
 
-                    gcloud artifacts generic upload \
-                      --project=${PROJECT_ID} \
-                      --location=${REGION} \
-                      --repository=${WAR_REPOSITORY} \
-                      --package=${PACKAGE_NAME} \
-                      --version=${HANDOFF} \
-                      --source="target/${WAR_FILE}"
+                    sh """
+                        gcloud artifacts generic upload \
+                          --project=gcp-gke-12345 \
+                          --location=asia-south1 \
+                          --repository=war-files \
+                          --package=myapp \
+                          --version='${handoff}' \
+                          --source=target/myapp.war
+                    """
 
                     echo ""
-                    echo "WAR uploaded successfully."
-                """
+                    echo "WAR upload completed successfully."
+                }
             }
         }
 
 
-        /*
-         * =========================================================
-         * 8. VERIFY ARTIFACT
-         * =========================================================
-         */
         stage('Verify Artifact') {
 
             steps {
 
                 script {
 
-                    echo "Verifying uploaded artifact..."
+                    def handoff = env.HANDOFF
 
-                    def versionsOutput = sh(
-                        script: """
+                    echo "======================================"
+                    echo "Verifying Artifact Registry"
+                    echo "======================================"
+
+                    def output = sh(
+                        script: '''
                             gcloud artifacts versions list \
-                              --project=${PROJECT_ID} \
-                              --location=${REGION} \
-                              --repository=${WAR_REPOSITORY} \
-                              --package=${PACKAGE_NAME} \
+                              --project=gcp-gke-12345 \
+                              --location=asia-south1 \
+                              --repository=war-files \
+                              --package=myapp \
                               --format="value(name.basename())" \
                               2>/dev/null
-                        """,
+                        ''',
                         returnStdout: true
                     ).trim()
 
-                    def versions = versionsOutput
-                        ? versionsOutput.readLines().collect { it.trim() }
-                        : []
+                    def versions = []
 
-                    if (!versions.contains(env.HANDOFF)) {
+                    if (output) {
+                        versions = output.readLines()
+                    }
+
+                    if (!versions.contains(handoff)) {
 
                         error(
                             "Artifact verification failed. " +
-                            "Handoff ${env.HANDOFF} was not found."
+                            "Version ${handoff} was not found in Artifact Registry."
                         )
                     }
 
-                    echo "======================================"
-                    echo "Artifact verified successfully"
-                    echo "======================================"
+                    echo ""
+                    echo "✅ Artifact verified successfully."
 
                     echo ""
-                    echo "Handoff Number : ${env.HANDOFF}"
-
-                    echo ""
-                    echo "Artifact:"
-                    echo "war-files / myapp / ${env.HANDOFF} / myapp.war"
+                    echo "Artifact path:"
+                    echo "war-files / myapp / ${handoff} / myapp.war"
                 }
             }
         }
     }
 
 
-    /*
-     * =============================================================
-     * POST ACTIONS
-     * =============================================================
-     */
     post {
 
         success {
@@ -358,18 +304,17 @@ pipeline {
 
                 echo ""
                 echo "======================================"
-                echo "        JOB 1 SUCCESS"
+                echo "          JOB 1 SUCCESS"
                 echo "======================================"
 
-                echo "Handoff Number : ${env.HANDOFF}"
+                echo "Handoff : ${env.HANDOFF}"
 
                 echo ""
-                echo "WAR Artifact:"
+                echo "Artifact:"
                 echo "war-files / myapp / ${env.HANDOFF} / myapp.war"
 
                 echo ""
-                echo "Next step:"
-                echo "Jenkins Job 2 can use ${env.HANDOFF}"
+                echo "Ready for Jenkins Job 2."
 
                 echo "======================================"
             }
@@ -379,10 +324,10 @@ pipeline {
 
             echo ""
             echo "======================================"
-            echo "        JOB 1 FAILED"
+            echo "          JOB 1 FAILED"
             echo "======================================"
 
-            echo "Check the stage above for the failure."
+            echo "Review the error above."
 
             echo "======================================"
         }
