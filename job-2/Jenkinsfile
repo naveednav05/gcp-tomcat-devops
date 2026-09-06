@@ -38,6 +38,7 @@ pipeline {
                     echo "JOB 2 - DOCKER IMAGE BUILD"
                     echo "=============================================="
                     echo "Handoff Number : ${handoff}"
+                    echo "Replace Image  : ${params.REPLACE_IMAGE}"
                     echo "=============================================="
                 }
             }
@@ -106,9 +107,7 @@ pipeline {
 
         /*
          * ============================================================
-         * 3. CHECK IF DOCKER IMAGE ALREADY EXISTS
-         *
-         * Prevents the same handoff from being reused.
+         * 3. CHECK EXISTING DOCKER IMAGE
          * ============================================================
          */
         stage('Check Existing Docker Image') {
@@ -142,14 +141,31 @@ pipeline {
 
                     if (imageExists == "true") {
 
-                        error(
-                            "Docker image '${imageName}' already exists. " +
-                            "The handoff '${handoff}' cannot be reused."
-                        )
-                    }
+                        echo ""
+                        echo "⚠️ Docker image already exists."
+                        echo "Handoff : ${handoff}"
+                        echo "Replace : ${params.REPLACE_IMAGE}"
 
-                    echo "✅ Docker image does not exist."
-                    echo "Safe to continue."
+                        if (!params.REPLACE_IMAGE) {
+
+                            error(
+                                "Docker image '${imageName}' already exists. " +
+                                "REPLACE_IMAGE is false. " +
+                                "Enable REPLACE_IMAGE to replace it."
+                            )
+                        }
+
+                        echo ""
+                        echo "⚠️ REPLACE_IMAGE=true"
+                        echo "Existing image will be replaced."
+                        echo "Continuing with Docker build..."
+
+                    } else {
+
+                        echo ""
+                        echo "✅ Docker image does not exist."
+                        echo "New image will be created."
+                    }
                 }
             }
         }
@@ -317,7 +333,7 @@ pipeline {
 
         /*
          * ============================================================
-         * 8. AUTHENTICATE DOCKER WITH ARTIFACT REGISTRY
+         * 8. AUTHENTICATE DOCKER
          * ============================================================
          */
         stage('Authenticate Docker') {
