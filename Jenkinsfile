@@ -12,7 +12,7 @@ pipeline {
         string(
             name: 'HANDOFF_NUMBER',
             defaultValue: 'HF-0098',
-            description: 'Enter handoff number. Format: HF-0000'
+            description: 'Enter handoff number in format HF-0000'
         )
 
         booleanParam(
@@ -25,25 +25,24 @@ pipeline {
     stages {
 
         stage('Validate Handoff') {
-
             steps {
-
                 script {
+
+                    if (!params.HANDOFF_NUMBER) {
+                        error("HANDOFF_NUMBER parameter is empty or was not supplied.")
+                    }
 
                     def handoff = params.HANDOFF_NUMBER.trim()
 
                     if (!(handoff ==~ /^HF-[0-9]{4}$/)) {
-
                         error(
-                            "Invalid handoff '${handoff}'. " +
-                            "Expected format HF-0000, example HF-0098."
+                            "Invalid handoff number: '${handoff}'. " +
+                            "Expected format: HF-0000. Example: HF-0098"
                         )
                     }
 
-                    env.HANDOFF = handoff
-
                     echo "======================================"
-                    echo "Handoff Number : ${env.HANDOFF}"
+                    echo "Handoff Number : ${handoff}"
                     echo "Replace        : ${params.REPLACE_HANDOFF}"
                     echo "======================================"
                 }
@@ -52,60 +51,51 @@ pipeline {
 
 
         stage('Check Existing Handoff') {
-
             steps {
-
                 script {
 
-                    echo "Checking Artifact Registry..."
+                    def handoff = params.HANDOFF_NUMBER.trim()
+
+                    echo "Checking Artifact Registry for ${handoff}..."
 
                     def output = sh(
-                        script: '''
+                        script: """
                             gcloud artifacts versions list \
                               --project=gcp-gke-12345 \
                               --location=asia-south1 \
                               --repository=war-files \
                               --package=myapp \
-                              --format="value(name.basename())" \
-                              2>/dev/null
-                        ''',
+                              --format="value(name.basename())"
+                        """,
                         returnStdout: true
                     ).trim()
 
-                    def versions = []
-
-                    if (output) {
-                        versions = output.readLines()
-                    }
-
-                    def exists = versions.contains(env.HANDOFF)
-
-                    env.HANDOFF_EXISTS = exists ? 'true' : 'false'
+                    def versions = output ? output.readLines() : []
 
                     echo "Existing versions:"
-                    echo "${versions}"
+                    echo versions.join('\n')
 
-                    echo "Handoff ${env.HANDOFF} exists: ${env.HANDOFF_EXISTS}"
+                    def handoffExists = versions.contains(handoff)
 
-                    if (exists && !params.REPLACE_HANDOFF) {
+                    if (handoffExists) {
 
-                        error(
-                            "Handoff ${env.HANDOFF} already exists. " +
-                            "Set REPLACE_HANDOFF=true to replace it."
-                        )
-                    }
+                        echo "⚠️ Handoff ${handoff} already exists."
 
-                    if (exists && params.REPLACE_HANDOFF) {
+                        if (!params.REPLACE_HANDOFF) {
 
-                        echo "⚠️ Existing handoff found."
-                        echo "Replacement requested."
-                        echo "Old artifact will be deleted AFTER successful WAR build."
-                    }
+                            error(
+                                "Handoff ${handoff} already exists. " +
+                                "Set REPLACE_HANDOFF=true to replace it."
+                            )
+                        }
 
-                    if (!exists) {
+                        echo "REPLACE_HANDOFF=true"
+                        echo "Existing handoff will be replaced."
 
-                        echo "✅ Handoff does not exist."
-                        echo "New artifact will be uploaded."
+                    } else {
+
+                        echo "✅ Handoff ${handoff} does not exist."
+                        echo "New handoff will be uploaded."
                     }
                 }
             }
@@ -113,18 +103,16 @@ pipeline {
 
 
         stage('Checkout') {
-
             steps {
 
                 checkout scm
 
-                echo "Git checkout completed."
+                echo "Source code checked out successfully."
             }
         }
 
 
         stage('Build WAR') {
-
             steps {
 
                 sh '''
@@ -142,7 +130,6 @@ pipeline {
 
 
         stage('Verify WAR') {
-
             steps {
 
                 sh '''
@@ -151,9 +138,7 @@ pipeline {
                     echo "======================================"
 
                     if [ ! -f target/myapp.war ]; then
-
-                        echo "ERROR: target/myapp.war does not exist."
-
+                        echo "ERROR: target/myapp.war was not created."
                         exit 1
                     fi
 
@@ -170,49 +155,74 @@ pipeline {
 
 
         stage('Delete Existing Handoff') {
-
-            when {
-
-                expression {
-                    return params.REPLACE_HANDOFF &&
-                           env.HANDOFF_EXISTS == 'true'
-                }
-            }
-
             steps {
-
                 script {
 
-                    def handoff = env.HANDOFF
+                    def handoff = params.HANDOFF_NUMBER.trim()
 
-                    echo "======================================"
-                    echo "Deleting Existing Handoff"
-                    echo "======================================"
+                    /*
+                     * Check again immediately before deleting.
+                     * This prevents attempting to delete a handoff
+                     * that does not actually exist.
+                     */
 
-                    echo "Deleting: ${handoff}"
+                    def output = sh(
+                        script: """
+                            gcloud artifacts versions list \
+                              --project=gcp-gke-12345 \
+                              --location=asia-south1 \
+                              --repository=war-files \
+                              --package=myapp \
+                              --format="value(name.basename())"
+                        """,
+                        returnStdout: true
+                    ).trim()
 
-                    sh """
-                        gcloud artifacts versions delete '${handoff}' \
-                          --project=gcp-gke-12345 \
-                          --location=asia-south1 \
-                          --repository=war-files \
-                          --package=myapp \
-                          --quiet
-                    """
+                    def versions = output ? output.readLines() : []
 
-                    echo "Existing handoff deleted successfully."
+                    def handoffExists = versions.contains(handoff)
+
+                    if (handoffExists && params.REPLACE_HANDOFF) {
+
+                        echo "======================================"
+                        echo "Deleting Existing Handoff"
+                        echo "======================================"
+
+                        echo "Deleting: ${handoff}"
+
+                        sh """
+                            gcloud artifacts versions delete '${handoff}' \
+                              --project=gcp-gke-12345 \
+                              --location=asia-south1 \
+                              --repository=war-files \
+                              --package=myapp \
+                              --quiet
+                        """
+
+                        echo "Existing handoff deleted successfully."
+
+                    } else {
+
+                        echo "Delete not required."
+
+                        if (!handoffExists) {
+                            echo "Handoff ${handoff} does not exist."
+                        }
+
+                        if (!params.REPLACE_HANDOFF) {
+                            echo "REPLACE_HANDOFF=false."
+                        }
+                    }
                 }
             }
         }
 
 
         stage('Upload WAR') {
-
             steps {
-
                 script {
 
-                    def handoff = env.HANDOFF
+                    def handoff = params.HANDOFF_NUMBER.trim()
 
                     echo "======================================"
                     echo "Uploading WAR"
@@ -223,7 +233,7 @@ pipeline {
                     echo "Repository : war-files"
                     echo "Package    : myapp"
                     echo "Version    : ${handoff}"
-                    echo "WAR        : target/myapp.war"
+                    echo "File       : target/myapp.war"
 
                     sh """
                         gcloud artifacts generic upload \
@@ -236,48 +246,41 @@ pipeline {
                     """
 
                     echo ""
-                    echo "WAR upload completed successfully."
+                    echo "WAR uploaded successfully."
                 }
             }
         }
 
 
         stage('Verify Artifact') {
-
             steps {
-
                 script {
 
-                    def handoff = env.HANDOFF
+                    def handoff = params.HANDOFF_NUMBER.trim()
 
                     echo "======================================"
-                    echo "Verifying Artifact Registry"
+                    echo "Verifying Artifact"
                     echo "======================================"
 
                     def output = sh(
-                        script: '''
+                        script: """
                             gcloud artifacts versions list \
                               --project=gcp-gke-12345 \
                               --location=asia-south1 \
                               --repository=war-files \
                               --package=myapp \
-                              --format="value(name.basename())" \
-                              2>/dev/null
-                        ''',
+                              --format="value(name.basename())"
+                        """,
                         returnStdout: true
                     ).trim()
 
-                    def versions = []
-
-                    if (output) {
-                        versions = output.readLines()
-                    }
+                    def versions = output ? output.readLines() : []
 
                     if (!versions.contains(handoff)) {
 
                         error(
                             "Artifact verification failed. " +
-                            "Version ${handoff} was not found in Artifact Registry."
+                            "Version ${handoff} was not found."
                         )
                     }
 
@@ -296,22 +299,22 @@ pipeline {
     post {
 
         success {
-
             script {
 
-                currentBuild.description =
-                    "WAR: ${env.HANDOFF}"
+                def handoff = params.HANDOFF_NUMBER.trim()
+
+                currentBuild.description = "WAR: ${handoff}"
 
                 echo ""
                 echo "======================================"
                 echo "          JOB 1 SUCCESS"
                 echo "======================================"
 
-                echo "Handoff : ${env.HANDOFF}"
+                echo "Handoff : ${handoff}"
 
                 echo ""
                 echo "Artifact:"
-                echo "war-files / myapp / ${env.HANDOFF} / myapp.war"
+                echo "war-files / myapp / ${handoff} / myapp.war"
 
                 echo ""
                 echo "Ready for Jenkins Job 2."
