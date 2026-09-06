@@ -400,47 +400,38 @@ pipeline {
          * 12. VERIFY IMAGE IN ARTIFACT REGISTRY
          * ============================================================
          */
-        stage('Verify Docker Image') {
-            steps {
-                script {
+      stage('Verify Docker Image') {
+    steps {
+        script {
 
-                    def handoff = params.HANDOFF_NUMBER.trim()
+            def handoff = params.HANDOFF_NUMBER.trim()
 
-                    def imageTags = sh(
-                        script: """
-                            gcloud artifacts docker images list \
-                              asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp \
-                              --include-tags \
-                              --format="value(tags)"
-                        """,
-                        returnStdout: true
-                    ).trim()
+            def image = sh(
+                script: """
+                    gcloud artifacts docker images describe \
+                      asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp:${handoff} \
+                      --format="value(image_summary.digest)"
+                """,
+                returnStdout: true
+            ).trim()
 
-                    def tagFound = imageTags
-                        .split(',')
-                        .collect { it.trim() }
-                        .contains(handoff)
-
-                    if (!tagFound) {
-
-                        error(
-                            "Docker image verification failed. " +
-                            "Tag '${handoff}' was not found in Artifact Registry."
-                        )
-                    }
-
-                    echo ""
-                    echo "=============================================="
-                    echo "✅ DOCKER IMAGE VERIFIED"
-                    echo "=============================================="
-                    echo "Image:"
-                    echo "asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp:${handoff}"
-                    echo "=============================================="
-                }
+            if (!image) {
+                error(
+                    "Docker image verification failed. " +
+                    "Image '${handoff}' was not found in Artifact Registry."
+                )
             }
+
+            echo ""
+            echo "=============================================="
+            echo "DOCKER IMAGE VERIFIED"
+            echo "=============================================="
+            echo "Tag    : ${handoff}"
+            echo "Digest : ${image}"
+            echo "=============================================="
         }
     }
-
+}
 
     /*
      * ================================================================
