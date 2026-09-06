@@ -1,0 +1,319 @@
+pipeline {
+
+    agent any
+
+    options {
+        disableConcurrentBuilds()
+        timestamps()
+    }
+
+    parameters {
+
+        string(
+            name: 'HANDOFF_NUMBER',
+            defaultValue: 'hf-0098',
+            description: 'Enter handoff number in format hf-0000 - all lowercase'
+        )
+    }
+
+    environment {
+
+        GCP_PROJECT = 'gcp-gke-12345'
+        GCP_REGION = 'asia-south1'
+
+        WAR_REPOSITORY = 'war-files'
+        WAR_PACKAGE = 'myapp'
+
+        TOMCAT_REGISTRY = 'asia-south1-docker.pkg.dev/gcp-gke-12345/tomcat-base'
+        TOMCAT_IMAGE = 'tomcat:v1'
+
+        APP_REGISTRY = 'asia-south1-docker.pkg.dev/gcp-gke-12345/application'
+        APP_IMAGE = 'myapp'
+    }
+
+    stages {
+
+        stage('Validate Handoff') {
+
+            steps {
+
+                script {
+
+                    if (!params.HANDOFF_NUMBER) {
+                        error(
+                            "HANDOFF_NUMBER parameter is empty or was not supplied."
+                        )
+                    }
+
+                    def handoff = params.HANDOFF_NUMBER.trim()
+
+                    if (!(handoff ==~ /^hf-[0-9]{4}$/)) {
+
+                        error(
+                            "Invalid handoff number: '${handoff}'. " +
+                            "Expected format: hf-0000. Example: hf-0098"
+                        )
+                    }
+
+                    echo "======================================"
+                    echo "Job 2 - Docker Image Build"
+                    echo "======================================"
+                    echo "Handoff Number : ${handoff}"
+                    echo "======================================"
+                }
+            }
+        }
+
+
+        stage('Checkout Job-2 Files') {
+
+            steps {
+
+                checkout([
+                    $class: 'GitSCM',
+
+                    branches: [[
+                        name: '*/PROD'
+                    ]],
+
+                    userRemoteConfigs: [[
+                        url: 'https://github.com/naveednav05/gcp-tomcat-devops.git',
+                        credentialsId: 'github-gcp-tomcat'
+                    ]],
+
+                    extensions: [
+
+                        [
+                            $class: 'SparseCheckoutPaths',
+
+                            sparseCheckoutPaths: [[
+                                path: 'job-2/'
+                            ]]
+                        ],
+
+                        [
+                            $class: 'CleanBeforeCheckout'
+                        ]
+                    ]
+                ])
+
+                sh '''
+                    echo "======================================"
+                    echo "Checked out files:"
+                    echo "======================================"
+
+                    find job-2 -maxdepth 2 -type f -print
+                '''
+
+                sh '''
+                    if [ ! -f job-2/Dockerfile ]; then
+                        echo "ERROR: job-2/Dockerfile not found."
+                        exit 1
+                    fi
+                '''
+            }
+        }
+
+
+        stage('Download WAR') {
+
+            steps {
+
+                script {
+
+                    def handoff = params.HANDOFF_NUMBER.trim()
+
+                    sh """
+                        echo "======================================"
+                        echo "Downloading WAR"
+                        echo "======================================"
+
+                        mkdir -p build-context
+
+                        gcloud artifacts generic download \
+                          --project='${GCP_PROJECT}' \
+                          --location='${GCP_REGION}' \
+                          --repository='${WAR_REPOSITORY}' \
+                          --package='${WAR_PACKAGE}' \
+                          --version='${handoff}' \
+                          --name='myapp.war' \
+                          --destination="\$PWD/build-context"
+
+                        echo ""
+                        echo "Downloaded WAR:"
+                        ls -lh build-context/myapp.war
+                    """
+                }
+            }
+        }
+
+
+        stage('Prepare Docker Build Context') {
+
+            steps {
+
+                sh '''
+                    echo "======================================"
+                    echo "Preparing Docker Build Context"
+                    echo "======================================"
+
+                    cp job-2/Dockerfile build-context/Dockerfile
+
+                    echo ""
+                    echo "Build context:"
+                    ls -lh build-context/
+
+                    echo ""
+                    echo "Dockerfile:"
+                    cat build-context/Dockerfile
+                '''
+            }
+        }
+
+
+        stage('Pull Tomcat Base Image') {
+
+            steps {
+
+                sh """
+                    echo "======================================"
+                    echo "Pulling Tomcat Base Image"
+                    echo "======================================"
+
+                    docker pull ${TOMCAT_REGISTRY}/${TOMCAT_IMAGE}
+                """
+            }
+        }
+
+
+        stage('Build Docker Image') {
+
+            steps {
+
+                script {
+
+                    def handoff = params.HANDOFF_NUMBER.trim()
+
+                    sh """
+                        echo "======================================"
+                        echo "Building Application Docker Image"
+                        echo "======================================"
+
+                        cd build-context
+
+                        docker build \
+                          -t ${APP_IMAGE}:${handoff} \
+                          .
+
+                        echo ""
+                        echo "Docker image created:"
+                        docker image ls ${APP_IMAGE}:${handoff}
+                    """
+                }
+            }
+        }
+
+
+        stage('Tag Docker Image') {
+
+            steps {
+
+                script {
+
+                    def handoff = params.HANDOFF_NUMBER.trim()
+
+                    sh """
+                        echo "======================================"
+                        echo "Tagging Docker Image"
+                        echo "======================================"
+
+                        docker tag \
+                          ${APP_IMAGE}:${handoff} \
+                          ${APP_REGISTRY}/${APP_IMAGE}:${handoff}
+
+                        echo ""
+                        echo "Final image:"
+                        echo "${APP_REGISTRY}/${APP_IMAGE}:${handoff}"
+                    """
+                }
+            }
+        }
+
+
+        stage('Push Docker Image') {
+
+            steps {
+
+                script {
+
+                    def handoff = params.HANDOFF_NUMBER.trim()
+
+                    sh """
+                        echo "======================================"
+                        echo "Pushing Docker Image"
+                        echo "======================================"
+
+                        docker push \
+                          ${APP_REGISTRY}/${APP_IMAGE}:${handoff}
+                    """
+                }
+            }
+        }
+
+
+        stage('Verify Docker Image') {
+
+            steps {
+
+                script {
+
+                    def handoff = params.HANDOFF_NUMBER.trim()
+
+                    sh """
+                        echo "======================================"
+                        echo "Verifying Docker Image"
+                        echo "======================================"
+
+                        gcloud artifacts docker images list \
+                          ${APP_REGISTRY}/${APP_IMAGE} \
+                          --include-tags \
+                          --format="table(package,version,tags)"
+                    """
+
+                    echo ""
+                    echo "Expected image:"
+                    echo "${APP_REGISTRY}/${APP_IMAGE}:${handoff}"
+                }
+            }
+        }
+    }
+
+
+    post {
+
+        success {
+
+            script {
+
+                def handoff = params.HANDOFF_NUMBER.trim()
+
+                currentBuild.description =
+                    "Docker Image: ${handoff}"
+
+                echo "======================================"
+                echo "JOB 2 SUCCESS"
+                echo "======================================"
+                echo "Handoff : ${handoff}"
+                echo "Image   : ${APP_REGISTRY}/${APP_IMAGE}:${handoff}"
+                echo "======================================"
+            }
+        }
+
+        failure {
+
+            echo "======================================"
+            echo "JOB 2 FAILED"
+            echo "======================================"
+        }
+    }
+}
