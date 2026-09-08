@@ -17,6 +17,8 @@ spec:
         app: {{ .Release.Name }}
 
     spec:
+      imagePullSecrets:
+        - name: artifact-registry-secret
       containers:
         - name: myapp
 
