@@ -1,0 +1,333 @@
+pipeline {
+
+    agent any
+
+    parameters {
+
+        string(
+            name: 'HANDOFF_NUMBER',
+            defaultValue: 'hf-0002',
+            description: 'Docker image tag to deploy. Example: hf-0002'
+        )
+
+        booleanParam(
+            name: 'REPLACE_DEPLOYMENT',
+            defaultValue: false,
+            description: 'Force redeployment when this handoff is already deployed'
+        )
+    }
+
+    environment {
+
+        GITHUB_REPO = 'https://github.com/naveednav05/gcp-tomcat-devops.git'
+        GITHUB_BRANCH = 'PROD'
+
+        VALUES_FILE = 'helm/myapp/values.yaml'
+
+        IMAGE_REPOSITORY =
+            'asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp'
+    }
+
+    stages {
+
+        stage('Validate Input') {
+            steps {
+                script {
+
+                    if (!(params.HANDOFF_NUMBER ==~ /^hf-[0-9]{4}$/)) {
+                        error(
+                            "Invalid HANDOFF_NUMBER: ${params.HANDOFF_NUMBER}. " +
+                            "Expected format: hf-0000"
+                        )
+                    }
+
+                    echo "Requested deployment: ${params.HANDOFF_NUMBER}"
+
+                    if (params.REPLACE_DEPLOYMENT) {
+                        echo "FORCE REPLACEMENT: ENABLED"
+                    } else {
+                        echo "FORCE REPLACEMENT: DISABLED"
+                    }
+                }
+            }
+        }
+
+        stage('Verify Docker Image') {
+            steps {
+                script {
+
+                    def image =
+                        "${env.IMAGE_REPOSITORY}:${params.HANDOFF_NUMBER}"
+
+                    echo "Checking Artifact Registry image:"
+                    echo image
+
+                    sh """
+                        set -e
+
+                        gcloud artifacts docker images list \
+                          ${IMAGE_REPOSITORY} \
+                          --include-tags \
+                          --format='value(tags)' \
+                          | tr ',' '\\n' \
+                          | grep -Fx '${HANDOFF_NUMBER}'
+                    """
+
+                    echo "Docker image exists: ${image}"
+                }
+            }
+        }
+
+        stage('Checkout PROD') {
+            steps {
+
+                git(
+                    branch: env.GITHUB_BRANCH,
+                    credentialsId: 'github-gcp-tomcat',
+                    url: env.GITHUB_REPO
+                )
+            }
+        }
+
+        stage('Read Current Deployment') {
+            steps {
+                script {
+
+                    def currentTag = sh(
+                        script: """
+                            awk '
+                                /^image:/ { in_image=1; next }
+                                in_image && /^  tag:/ {
+                                    print \$2
+                                    exit
+                                }
+                            ' ${VALUES_FILE}
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    if (!currentTag) {
+                        error(
+                            "Could not determine current image tag from ${VALUES_FILE}"
+                        )
+                    }
+
+                    env.CURRENT_TAG = currentTag
+
+                    echo "Current GitOps image tag : ${env.CURRENT_TAG}"
+                    echo "Requested image tag      : ${params.HANDOFF_NUMBER}"
+                }
+            }
+        }
+
+        stage('Check Replacement') {
+            steps {
+                script {
+
+                    if (env.CURRENT_TAG == params.HANDOFF_NUMBER) {
+
+                        if (!params.REPLACE_DEPLOYMENT) {
+
+                            error(
+                                "Deployment ${params.HANDOFF_NUMBER} is already " +
+                                "configured in ${VALUES_FILE}. " +
+                                "Set REPLACE_DEPLOYMENT=true to force redeployment."
+                            )
+                        }
+
+                        echo "Same handoff detected."
+                        echo "REPLACE_DEPLOYMENT=true."
+                        echo "Proceeding with forced rollout."
+
+                    } else {
+
+                        echo "New handoff detected."
+                        echo "Current : ${env.CURRENT_TAG}"
+                        echo "New     : ${params.HANDOFF_NUMBER}"
+                        echo "Normal deployment will proceed."
+                    }
+                }
+            }
+        }
+
+        stage('Update GitOps Files') {
+            steps {
+                script {
+
+                    if (env.CURRENT_TAG != params.HANDOFF_NUMBER) {
+
+                        sh """
+                            set -e
+
+                            sed -i \
+                              "s/^  tag: .*/  tag: ${HANDOFF_NUMBER}/" \
+                              ${VALUES_FILE}
+
+                            echo "Updated values.yaml:"
+                            grep -n '^  tag:' ${VALUES_FILE}
+                        """
+
+                    } else {
+
+                        /*
+                         * Same image tag + force replacement.
+                         *
+                         * Changing the pod-template annotation causes
+                         * Kubernetes to create a fresh ReplicaSet/Pod.
+                         */
+
+                        sh """
+                            set -e
+
+                            python3 - <<'PY'
+from pathlib import Path
+
+path = Path("${VALUES_FILE}")
+text = path.read_text()
+
+marker = "  forceRedeploy:"
+
+if marker in text:
+    lines = text.splitlines()
+    new_lines = []
+
+    for line in lines:
+        if line.startswith(marker):
+            new_lines.append(
+                f"  forceRedeploy: ${BUILD_NUMBER}"
+            )
+        else:
+            new_lines.append(line)
+
+    text = "\\n".join(new_lines) + "\\n"
+
+else:
+    text = text.rstrip() + "\\n\\nforceRedeploy: ${BUILD_NUMBER}\\n"
+
+path.write_text(text)
+PY
+
+                            echo "Force redeploy marker:"
+                            grep -n 'forceRedeploy:' ${VALUES_FILE}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Show Git Changes') {
+            steps {
+                sh """
+                    echo "Git changes:"
+                    git diff -- ${VALUES_FILE}
+                """
+            }
+        }
+
+        stage('Commit Changes') {
+            steps {
+                script {
+
+                    sh """
+                        set -e
+
+                        git config user.name "Jenkins"
+                        git config user.email "jenkins@localhost"
+
+                        git add ${VALUES_FILE}
+
+                        if git diff --cached --quiet; then
+                            echo "No Git changes detected."
+                            exit 1
+                        fi
+
+                        git commit \
+                          -m "Deploy ${HANDOFF_NUMBER}"
+                    """
+                }
+            }
+        }
+
+        stage('Push to GitHub') {
+            steps {
+
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'github-gcp-tomcat',
+                        usernameVariable: 'GIT_USERNAME',
+                        passwordVariable: 'GIT_PASSWORD'
+                    )
+                ]) {
+
+                    sh '''
+                        set -eu
+
+                        cat > "$WORKSPACE/git-askpass.sh" <<'EOF'
+#!/bin/sh
+
+case "$1" in
+    *Username*) printf '%s\\n' "$GIT_USERNAME" ;;
+    *Password*) printf '%s\\n' "$GIT_PASSWORD" ;;
+    *) exit 1 ;;
+esac
+EOF
+
+                        chmod 700 "$WORKSPACE/git-askpass.sh"
+
+                        export GIT_ASKPASS="$WORKSPACE/git-askpass.sh"
+                        export GIT_TERMINAL_PROMPT=0
+
+                        git push origin PROD
+
+                        rm -f "$WORKSPACE/git-askpass.sh"
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Git Commit') {
+            steps {
+                sh '''
+                    echo "Latest commit:"
+                    git log -1 --oneline
+
+                    echo ""
+                    echo "Final values.yaml image:"
+                    grep -n '^  tag:' helm/myapp/values.yaml
+                '''
+            }
+        }
+    }
+
+    post {
+
+        success {
+
+            echo """
+            ==========================================
+            GITOPS DEPLOYMENT SUCCESSFUL
+            ==========================================
+
+            Image:
+            ${IMAGE_REPOSITORY}:${HANDOFF_NUMBER}
+
+            Git branch:
+            ${GITHUB_BRANCH}
+
+            Argo CD:
+            Will automatically reconcile the Git change.
+
+            ==========================================
+            """
+        }
+
+        failure {
+
+            echo """
+            ==========================================
+            GITOPS DEPLOYMENT FAILED
+            ==========================================
+            """
+        }
+    }
+}
