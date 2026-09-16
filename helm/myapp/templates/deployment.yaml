@@ -15,7 +15,8 @@ spec:
     metadata:
       labels:
         app: {{ .Release.Name }}
-
+      annotations:
+          gitops/force-redeploy: "{{ .Values.forceRedeploy | default 0 }}"
     spec:
       imagePullSecrets:
         - name: artifact-registry-secret
