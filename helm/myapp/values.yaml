@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp
-  tag: hf-0001
+  tag: hf-0002
   pullPolicy: IfNotPresent
 
 service:
