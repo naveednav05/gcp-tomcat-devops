@@ -17,3 +17,5 @@ resources:
   limits:
     cpu: 500m
     memory: 512Mi
+
+forceRedeploy: 0
