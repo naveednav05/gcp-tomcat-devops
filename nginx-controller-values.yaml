@@ -1,0 +1,27 @@
+# Helm values for the NGINX Ingress Controller on the PROD cluster.
+# Install or upgrade with:
+# helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+#   --repo https://kubernetes.github.io/ingress-nginx \
+#   --namespace ingress-nginx --create-namespace \
+#   --values nginx-controller-values.yaml
+#
+# The LoadBalancer Service uses the GKE cluster's default external load balancer.
+# Reserve and configure a static IP separately if PROD requires a fixed address.
+
+controller:
+  replicaCount: 2
+
+  ingressClass: nginx
+  ingressClassResource:
+    enabled: true
+    name: nginx
+    default: false
+    controllerValue: k8s.io/ingress-nginx
+
+  service:
+    type: LoadBalancer
+
+  config:
+    proxy-body-size: "20m"
+    proxy-read-timeout: "60"
+    proxy-send-timeout: "60"
