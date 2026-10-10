@@ -385,7 +385,7 @@
 <div class="container">
 
     <nav>
-        <div class="logo">NAVEED<span>.UAT</span></div>
+        <div class="logo">NAVEED<span>.PROD</span></div>
         <div class="nav-status">
             <span class="dot"></span>
             <span>APPLICATION ONLINE</span>
