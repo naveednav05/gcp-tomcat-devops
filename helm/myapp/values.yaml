@@ -1,4 +1,4 @@
-
+# UAT environment values. Starts with the same image as PROD for baseline validation.
 replicaCount: 1
 
 image:
