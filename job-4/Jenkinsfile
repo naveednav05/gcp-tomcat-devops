@@ -108,7 +108,7 @@ if same_image:
     if marker:
         content = content[:marker.start()] + replacement + content[marker.end():]
     else:
-        content = content.rstrip() + "\n\n" + replacement + "\n"
+        content = content.rstrip() + chr(10) + chr(10) + replacement + chr(10)
 
 path.write_text(content)
 PY
