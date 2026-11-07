@@ -165,7 +165,7 @@ EOF
                     export GIT_ASKPASS="$WORKSPACE/git-askpass.sh"
                     export GIT_TERMINAL_PROMPT=0
 
-                    git push origin "$GIT_BRANCH"
+                    git push origin "HEAD:refs/heads/$GIT_BRANCH"
 
                     rm -f "$WORKSPACE/git-askpass.sh"
                 '''
