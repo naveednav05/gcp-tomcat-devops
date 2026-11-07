@@ -1,0 +1,568 @@
+
+/*
+ * ================================================================
+ * JOB 4 - RELEASE-MYAPP
+ *
+ * Orchestrates:
+ *   Job 2       : Docker image build and push
+ *   GitHub      : Helm values update
+ *   Argo CD     : Automatic Kubernetes deployment
+ *
+ * Environments:
+ *   UAT  -> uat branch
+ *   PROD -> PROD branch
+ * ================================================================
+ */
+
+def updateGitOps(String branch, String handoff, boolean forceRedeploy) {
+
+    dir("gitops-${branch}") {
+
+        echo "Updating GitOps branch: ${branch}"
+
+        checkout([
+            $class: 'GitSCM',
+            branches: [[name: "*/${branch}"]],
+            userRemoteConfigs: [[
+                url: 'https://github.com/naveednav05/gcp-tomcat-devops.git',
+                credentialsId: 'github-gcp-tomcat'
+            ]],
+            extensions: [
+                [$class: 'CleanBeforeCheckout']
+            ]
+        ])
+
+        def valuesFile = 'helm/myapp/values.yaml'
+
+        if (!fileExists(valuesFile)) {
+            error("Helm values file not found: ${valuesFile}")
+        }
+
+        def currentTag = sh(
+            script: """
+                awk '
+                    /^image:/ { in_image=1; next }
+                    in_image && /^  tag:/ {
+                        print \\$2
+                        exit
+                    }
+                ' ${valuesFile}
+            """,
+            returnStdout: true
+        ).trim()
+
+        if (!currentTag) {
+            error("Unable to read current image tag from ${valuesFile}")
+        }
+
+        echo "Current image : ${currentTag}"
+        echo "New image     : ${handoff}"
+
+        if (currentTag == handoff && !forceRedeploy) {
+            error(
+                "Image ${handoff} is already configured. " +
+                "Set REPLACE_DEPLOYMENT=true to force redeployment."
+            )
+        }
+
+        withEnv([
+            "NEW_IMAGE_TAG=${handoff}",
+            "PIPELINE_BUILD=${env.BUILD_NUMBER}",
+            "SAME_IMAGE=${currentTag == handoff ? 'true' : 'false'}"
+        ]) {
+
+            sh '''
+                set -eu
+
+                python3 - <<'PY'
+import os
+import re
+from pathlib import Path
+
+path = Path("helm/myapp/values.yaml")
+content = path.read_text()
+
+tag = os.environ["NEW_IMAGE_TAG"]
+build = os.environ["PIPELINE_BUILD"]
+same_image = os.environ["SAME_IMAGE"] == "true"
+
+content, count = re.subn(
+    r"(?m)^  tag: .*?$",
+    f"  tag: {tag}",
+    content,
+    count=1
+)
+
+if count != 1:
+    raise SystemExit("Could not update image tag.")
+
+if same_image:
+    marker = re.search(
+        r"(?m)^forceRedeploy:\\s*\\d+\\s*$",
+        content
+    )
+
+    replacement = f"forceRedeploy: {build}"
+
+    if marker:
+        content = content[:marker.start()] + replacement + content[marker.end():]
+    else:
+        content = content.rstrip() + "\\n\\n" + replacement + "\\n"
+
+path.write_text(content)
+PY
+
+                echo "Updated Helm image configuration:"
+                grep -n -E '^  tag:|^forceRedeploy:' helm/myapp/values.yaml
+            '''
+        }
+
+        sh '''
+            set -eu
+
+            git config user.name "Jenkins"
+            git config user.email "jenkins@localhost"
+
+            git add helm/myapp/values.yaml
+
+            if git diff --cached --quiet; then
+                echo "No Git changes detected."
+                exit 1
+            fi
+
+            git diff --cached -- helm/myapp/values.yaml
+
+            git commit -m "Release ${NEW_IMAGE_TAG}"
+        '''
+
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'github-gcp-tomcat',
+                usernameVariable: 'GIT_USERNAME',
+                passwordVariable: 'GIT_PASSWORD'
+            )
+        ]) {
+
+            withEnv(["GIT_BRANCH=${branch}"]) {
+
+                sh '''
+                    set -eu
+
+                    cat > "$WORKSPACE/git-askpass.sh" <<'EOF'
+#!/bin/sh
+case "$1" in
+    *Username*) printf '%s\\n' "$GIT_USERNAME" ;;
+    *Password*) printf '%s\\n' "$GIT_PASSWORD" ;;
+    *) exit 1 ;;
+esac
+EOF
+
+                    chmod 700 "$WORKSPACE/git-askpass.sh"
+
+                    export GIT_ASKPASS="$WORKSPACE/git-askpass.sh"
+                    export GIT_TERMINAL_PROMPT=0
+
+                    git push origin "$GIT_BRANCH"
+
+                    rm -f "$WORKSPACE/git-askpass.sh"
+                '''
+            }
+        }
+
+        echo "GitOps update pushed successfully to ${branch}."
+        echo "Argo CD will reconcile the environment."
+    }
+}
+
+
+pipeline {
+
+    agent any
+
+    options {
+        disableConcurrentBuilds()
+        timestamps()
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+
+        choice(
+            name: 'ACTION',
+            choices: [
+                'BUILD_ONLY',
+                'BUILD_DEPLOY_UAT',
+                'BUILD_DEPLOY_PROD',
+                'EXISTING_UAT',
+                'EXISTING_PROD',
+                'PROMOTE_UAT_TO_PROD'
+            ],
+            description: 'Select the release operation.'
+        )
+
+        string(
+            name: 'HANDOFF_NUMBER',
+            defaultValue: '',
+            description: 'WAR/image handoff tag. Example: hf-0032'
+        )
+
+        booleanParam(
+            name: 'REPLACE_IMAGE',
+            defaultValue: false,
+            description: 'Allow Job 2 to replace an existing Docker image tag.'
+        )
+
+        booleanParam(
+            name: 'REPLACE_DEPLOYMENT',
+            defaultValue: false,
+            description: 'Force redeployment when the same image tag is already configured.'
+        )
+    }
+
+    environment {
+
+        GITHUB_REPO =
+            'https://github.com/naveednav05/gcp-tomcat-devops.git'
+
+        IMAGE_REPOSITORY =
+            'asia-south1-docker.pkg.dev/gcp-gke-12345/application/myapp'
+
+        GCP_PROJECT = 'gcp-gke-12345'
+    }
+
+    stages {
+
+        /*
+         * ------------------------------------------------------------
+         * 1. VALIDATE INPUT
+         * ------------------------------------------------------------
+         */
+
+        stage('Validate Release Parameters') {
+
+            steps {
+                script {
+
+                    def handoff = params.HANDOFF_NUMBER.trim()
+
+                    if (!(handoff ==~ /^hf-[0-9]{4}$/)) {
+                        error(
+                            "Invalid handoff number. Expected hf-0000 format."
+                        )
+                    }
+
+                    env.RELEASE_TAG = handoff
+
+                    echo "======================================"
+                    echo "JOB 4 - RELEASE MYAPP"
+                    echo "======================================"
+                    echo "Action : ${params.ACTION}"
+                    echo "Handoff: ${handoff}"
+                    echo "======================================"
+                }
+            }
+        }
+
+
+        /*
+         * ------------------------------------------------------------
+         * 2. BUILD IMAGE THROUGH EXISTING JOB 2
+         * ------------------------------------------------------------
+         */
+
+        stage('Build Docker Image') {
+
+            when {
+                expression {
+                    params.ACTION in [
+                        'BUILD_ONLY',
+                        'BUILD_DEPLOY_UAT',
+                        'BUILD_DEPLOY_PROD'
+                    ]
+                }
+            }
+
+            steps {
+                script {
+
+                    echo "Triggering existing Job 2..."
+
+                    def result = build(
+                        job: 'build-docker-image',
+                        parameters: [
+                            string(
+                                name: 'HANDOFF_NUMBER',
+                                value: env.RELEASE_TAG
+                            ),
+                            booleanParam(
+                                name: 'REPLACE_IMAGE',
+                                value: params.REPLACE_IMAGE
+                            )
+                        ],
+                        wait: true,
+                        propagate: true
+                    )
+
+                    echo "Job 2 result: ${result.result}"
+                }
+            }
+        }
+
+
+        /*
+         * ------------------------------------------------------------
+         * 3. VERIFY IMAGE
+         * ------------------------------------------------------------
+         */
+
+        stage('Verify Artifact Registry Image') {
+
+            steps {
+                script {
+
+                    def image =
+                        "${env.IMAGE_REPOSITORY}:${env.RELEASE_TAG}"
+
+                    echo "Verifying image: ${image}"
+
+                    def digest = sh(
+                        script: """
+                            gcloud artifacts docker images describe \
+                              '${image}' \
+                              --project='${env.GCP_PROJECT}' \
+                              --format='value(image_summary.digest)'
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    if (!digest) {
+                        error("Docker image verification failed.")
+                    }
+
+                    echo "Image verified successfully."
+                    echo "Digest: ${digest}"
+                }
+            }
+        }
+
+
+        /*
+         * ------------------------------------------------------------
+         * 4. UAT APPROVAL
+         * ------------------------------------------------------------
+         */
+
+        stage('DevOps Approval - UAT') {
+
+            when {
+                expression {
+                    params.ACTION in [
+                        'BUILD_DEPLOY_UAT',
+                        'EXISTING_UAT',
+                        'PROMOTE_UAT_TO_PROD'
+                    ]
+                }
+            }
+
+            steps {
+
+                input(
+                    message: "Approve deployment of ${env.RELEASE_TAG} to UAT?",
+                    ok: 'Approve UAT Deployment'
+                )
+            }
+        }
+
+
+        /*
+         * ------------------------------------------------------------
+         * 5. DEPLOY UAT
+         * ------------------------------------------------------------
+         */
+
+        stage('Deploy to UAT') {
+
+            when {
+                expression {
+                    params.ACTION in [
+                        'BUILD_DEPLOY_UAT',
+                        'EXISTING_UAT',
+                        'PROMOTE_UAT_TO_PROD'
+                    ]
+                }
+            }
+
+            steps {
+                script {
+
+                    updateGitOps(
+                        'uat',
+                        env.RELEASE_TAG,
+                        params.REPLACE_DEPLOYMENT
+                    )
+                }
+            }
+        }
+
+
+        /*
+         * ------------------------------------------------------------
+         * 6. UAT TESTING SIGN-OFF
+         * ------------------------------------------------------------
+         */
+
+        stage('UAT Testing Sign-off') {
+
+            when {
+                expression {
+                    params.ACTION in [
+                        'BUILD_DEPLOY_UAT',
+                        'EXISTING_UAT',
+                        'PROMOTE_UAT_TO_PROD'
+                    ]
+                }
+            }
+
+            steps {
+
+                input(
+                    message: "Confirm UAT testing passed for ${env.RELEASE_TAG}.",
+                    ok: 'UAT Testing Passed'
+                )
+            }
+        }
+
+
+        /*
+         * ------------------------------------------------------------
+         * 7. PROD APPROVAL
+         * ------------------------------------------------------------
+         */
+
+        stage('Production Approval') {
+
+            when {
+                expression {
+                    params.ACTION in [
+                        'BUILD_DEPLOY_PROD',
+                        'EXISTING_PROD',
+                        'PROMOTE_UAT_TO_PROD'
+                    ]
+                }
+            }
+
+            steps {
+
+                input(
+                    message: "Approve production deployment of ${env.RELEASE_TAG}?",
+                    ok: 'Approve Production'
+                )
+            }
+        }
+
+
+        /*
+         * ------------------------------------------------------------
+         * 8. DEPLOY PROD
+         * ------------------------------------------------------------
+         */
+
+        stage('Deploy to PROD') {
+
+            when {
+                expression {
+                    params.ACTION in [
+                        'BUILD_DEPLOY_PROD',
+                        'EXISTING_PROD',
+                        'PROMOTE_UAT_TO_PROD'
+                    ]
+                }
+            }
+
+            steps {
+                script {
+
+                    updateGitOps(
+                        'PROD',
+                        env.RELEASE_TAG,
+                        params.REPLACE_DEPLOYMENT
+                    )
+                }
+            }
+        }
+
+
+        /*
+         * ------------------------------------------------------------
+         * 9. PRODUCTION SIGN-OFF
+         * ------------------------------------------------------------
+         */
+
+        stage('Production Sign-off') {
+
+            when {
+                expression {
+                    params.ACTION in [
+                        'BUILD_DEPLOY_PROD',
+                        'EXISTING_PROD',
+                        'PROMOTE_UAT_TO_PROD'
+                    ]
+                }
+            }
+
+            steps {
+
+                input(
+                    message: "Confirm production validation passed for ${env.RELEASE_TAG}.",
+                    ok: 'Production Validation Passed'
+                )
+            }
+        }
+    }
+
+
+    /*
+     * ------------------------------------------------------------
+     * POST ACTIONS
+     * ------------------------------------------------------------
+     */
+
+    post {
+
+        success {
+
+            echo """
+            ==========================================
+            RELEASE PIPELINE SUCCESSFUL
+            ==========================================
+
+            Action : ${ACTION}
+            Image  : ${IMAGE_REPOSITORY}:${HANDOFF_NUMBER}
+
+            Status : SUCCESS
+
+            ==========================================
+            """
+        }
+
+        failure {
+
+            echo """
+            ==========================================
+            RELEASE PIPELINE FAILED
+            ==========================================
+
+            Action : ${ACTION}
+            Handoff: ${HANDOFF_NUMBER}
+
+            Check the failed stage in Jenkins.
+
+            ==========================================
+            """
+        }
+
+        always {
+            echo "Job 4 execution completed."
+        }
+    }
+}
