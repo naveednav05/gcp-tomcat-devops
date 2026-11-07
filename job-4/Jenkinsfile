@@ -99,7 +99,7 @@ if count != 1:
 
 if same_image:
     marker = re.search(
-        r"(?m)^forceRedeploy:\s*\d+\s*$",
+        r"(?m)^forceRedeploy:[ ]*[0-9]+[ ]*$",
         content
     )
 
